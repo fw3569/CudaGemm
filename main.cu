@@ -197,7 +197,50 @@ int main() {
   float tflops =
       (2.0 * ROW_NUM * COL_NUM * MID_NUM) / (time_ms_kernel * 1e-3) / 1e12;
   if (compare_result(c, ground_truth) == 0) {
-    std::cout << "ok\nkernel time: " << time_ms_kernel << "ms, total time: "
+    std::cout << "ok" << std::endl;
+    for (int i = 0; i < 10; ++i) {
+      gemm<<<dim3((ROW_NUM + ((THREAD_SIZE * LOCAL_SIZE) - 1)) /
+                      (THREAD_SIZE * LOCAL_SIZE),
+                  (COL_NUM + ((THREAD_SIZE * LOCAL_SIZE) - 1)) /
+                      (THREAD_SIZE * LOCAL_SIZE)),
+             dim3(THREAD_SIZE, THREAD_SIZE)>>>(dev_a, dev_b, dev_c, ROW_NUM,
+                                               COL_NUM, MID_NUM);
+    }
+    time_ms_kernel = 0.0f;
+    for (int i = 0; i < 100; ++i) {
+      float time_ms;
+      cudaEventRecord(start);
+      gemm<<<dim3((ROW_NUM + ((THREAD_SIZE * LOCAL_SIZE) - 1)) /
+                      (THREAD_SIZE * LOCAL_SIZE),
+                  (COL_NUM + ((THREAD_SIZE * LOCAL_SIZE) - 1)) /
+                      (THREAD_SIZE * LOCAL_SIZE)),
+             dim3(THREAD_SIZE, THREAD_SIZE)>>>(dev_a, dev_b, dev_c, ROW_NUM,
+                                               COL_NUM, MID_NUM);
+      cudaEventRecord(stop);
+      cudaEventSynchronize(stop);
+      cudaEventElapsedTime(&time_ms, start, stop);
+      time_ms_kernel += time_ms;
+    }
+    time_ms_kernel /= 100;
+    for (int i = 0; i < 10; ++i) {
+      cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, COL_NUM, ROW_NUM,
+                  MID_NUM, &alpha, dev_b, COL_NUM, dev_a, MID_NUM, &beta, dev_c,
+                  COL_NUM);
+    }
+    time_ms_cublas_kernel = 0.0f;
+    for (int i = 0; i < 100; ++i) {
+      float time_ms;
+      cudaEventRecord(start);
+      cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, COL_NUM, ROW_NUM,
+                  MID_NUM, &alpha, dev_b, COL_NUM, dev_a, MID_NUM, &beta, dev_c,
+                  COL_NUM);
+      cudaEventRecord(stop);
+      cudaEventSynchronize(stop);
+      cudaEventElapsedTime(&time_ms, start, stop);
+      time_ms_cublas_kernel += time_ms;
+    }
+    time_ms_cublas_kernel /= 100;
+    std::cout << "kernel time : " << time_ms_kernel << "ms, total time: "
               << time_ms_memcpy_in + time_ms_kernel + time_ms_memcpy_out
               << "ms, tflops: " << tflops << std::endl;
     std::cout << "cublas kernel time: " << time_ms_cublas_kernel
