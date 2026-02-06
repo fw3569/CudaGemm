@@ -10,37 +10,62 @@
 #define ROW_NUM 1024
 #define COL_NUM 1024
 #define MID_NUM 1024
-#define TILE_SIZE 16
-#define VALUE_MAX 1000
+#define THREAD_SIZE 16
+#define LOCAL_SIZE 4
+#define VALUE_MAX 100.0f
 
 __global__ void gemm(float* a, float* b, float* c, int N, int M, int K) {
-  __shared__ float sa[TILE_SIZE][TILE_SIZE + 1];
-  __shared__ float sb[TILE_SIZE][TILE_SIZE + 1];
-  int base_row = blockIdx.x * TILE_SIZE;
-  int base_col = blockIdx.y * TILE_SIZE;
-  float ans = 0.0f;
-  for (int kh = 0; kh < K; kh += TILE_SIZE) {
-    if (base_row + threadIdx.y < N && kh + threadIdx.x < K) {
-      sa[threadIdx.y][threadIdx.x] =
-          a[(base_row + threadIdx.y) * K + kh + threadIdx.x];
-    } else {
-      sa[threadIdx.y][threadIdx.x] = 0.0f;
+  __shared__ alignas(
+      128) float sa[THREAD_SIZE * LOCAL_SIZE][THREAD_SIZE * LOCAL_SIZE];
+  __shared__ alignas(
+      128) float sb[THREAD_SIZE * LOCAL_SIZE][THREAD_SIZE * LOCAL_SIZE];
+  int base_row = blockIdx.x * THREAD_SIZE * LOCAL_SIZE;
+  int base_col = blockIdx.y * THREAD_SIZE * LOCAL_SIZE;
+  float ans[LOCAL_SIZE][LOCAL_SIZE];
+  memset(ans, 0, sizeof(ans));
+  for (int kh = 0; kh < K; kh += THREAD_SIZE * LOCAL_SIZE) {
+    for (int i = 0; i < LOCAL_SIZE * LOCAL_SIZE; ++i) {
+      int col = threadIdx.y * THREAD_SIZE + threadIdx.x +
+                i * THREAD_SIZE * THREAD_SIZE;
+      int row = col / (THREAD_SIZE * LOCAL_SIZE);
+      col %= THREAD_SIZE * LOCAL_SIZE;
+      sa[row][col] = (base_row + row < N && kh + col < K) *
+                     (a[(base_row + row) * K + kh + col]);
     }
-    if (base_col + threadIdx.x < M && kh + threadIdx.y < K) {
-      sb[threadIdx.x][threadIdx.y] =
-          b[(kh + threadIdx.y) * M + base_col + threadIdx.x];
-    } else {
-      sb[threadIdx.x][threadIdx.y] = 0.0f;
+    for (int i = 0; i < LOCAL_SIZE * LOCAL_SIZE; ++i) {
+      int col = threadIdx.y * THREAD_SIZE + threadIdx.x +
+                i * THREAD_SIZE * THREAD_SIZE;
+      int row = col / (THREAD_SIZE * LOCAL_SIZE);
+      col %= THREAD_SIZE * LOCAL_SIZE;
+      sb[row][col] = (kh + row < K && base_col + col < M) *
+                     (b[(kh + row) * M + base_col + col]);
     }
     __syncthreads();
 
-    for (int kl = 0; kl < TILE_SIZE; ++kl) {
-      ans += sa[threadIdx.x][kl] * sb[threadIdx.y][kl];
+    for (int kl = 0; kl < THREAD_SIZE * LOCAL_SIZE; ++kl) {
+      float rega[LOCAL_SIZE];
+      float regb[LOCAL_SIZE];
+      for (int i = 0; i < LOCAL_SIZE; ++i) {
+        rega[i] = sa[threadIdx.y + i * THREAD_SIZE][kl];
+      }
+      for (int i = 0; i < LOCAL_SIZE; ++i) {
+        regb[i] = sb[kl][threadIdx.x + i * THREAD_SIZE];
+      }
+      for (int i = 0; i < LOCAL_SIZE; ++i) {
+        for (int j = 0; j < LOCAL_SIZE; ++j) {
+          ans[i][j] += rega[i] * regb[j];
+        }
+      }
     }
     __syncthreads();
   }
-  if (base_row + threadIdx.x < N && base_col + threadIdx.y < M) {
-    c[(base_row + threadIdx.x) * N + base_col + threadIdx.y] = ans;
+  for (int i = 0;
+       i < LOCAL_SIZE && base_row + threadIdx.y + i * THREAD_SIZE < N; ++i) {
+    for (int j = 0;
+         j < LOCAL_SIZE && base_col + threadIdx.x + j * THREAD_SIZE < M; ++j) {
+      c[(base_row + threadIdx.y + i * THREAD_SIZE) * M + base_col +
+        threadIdx.x + j * THREAD_SIZE] = ans[i][j];
+    }
   }
 }
 
@@ -59,7 +84,9 @@ int compare_result(float c[ROW_NUM][COL_NUM],
                    float ground_truth[ROW_NUM][COL_NUM]) {
   for (int i = 0; i < ROW_NUM; ++i) {
     for (int j = 0; j < COL_NUM; ++j) {
-      if (c[i][j] != ground_truth[i][j]) {
+      if (!std::isfinite(c[i][j]) || !std::isfinite(ground_truth[i][j]) ||
+          fabs(c[i][j] - ground_truth[i][j]) >=
+              1e-4 * max(fabs(c[i][j]), fabs(ground_truth[i][j]))) {
         return 1;
       }
     }
@@ -70,12 +97,12 @@ int compare_result(float c[ROW_NUM][COL_NUM],
 void generate_tset_data(float a[ROW_NUM][MID_NUM], float b[MID_NUM][COL_NUM]) {
   for (int i = 0; i < ROW_NUM; ++i) {
     for (int j = 0; j < MID_NUM; ++j) {
-      a[i][j] = double(rand()) / RAND_MAX * VALUE_MAX;
+      a[i][j] = double(rand()) / RAND_MAX * VALUE_MAX - (VALUE_MAX / 2);
     }
   }
   for (int i = 0; i < MID_NUM; ++i) {
     for (int j = 0; j < COL_NUM; ++j) {
-      b[i][j] = double(rand()) / RAND_MAX * VALUE_MAX;
+      b[i][j] = double(rand()) / RAND_MAX * VALUE_MAX - (VALUE_MAX / 2);
     }
   }
 }
@@ -117,6 +144,7 @@ float a[ROW_NUM][MID_NUM], b[MID_NUM][COL_NUM], c[ROW_NUM][COL_NUM],
 float *dev_a, *dev_b, *dev_c;
 
 int main() {
+  srand(time(NULL));
   generate_tset_data(a, b);
   CHECK_CUDA_WITH_CLEANUP(cudaMalloc(&dev_a, sizeof(a)),
                           []() -> void { cudaFree(dev_a); });
@@ -135,10 +163,12 @@ int main() {
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&time_ms_memcpy_in, start, stop);
   cudaEventRecord(start);
-  gemm<<<dim3((ROW_NUM + (TILE_SIZE - 1)) / TILE_SIZE,
-              (COL_NUM + (TILE_SIZE - 1)) / TILE_SIZE),
-         dim3(TILE_SIZE, TILE_SIZE)>>>(dev_a, dev_b, dev_c, ROW_NUM, COL_NUM,
-                                       MID_NUM);
+  gemm<<<dim3((ROW_NUM + ((THREAD_SIZE * LOCAL_SIZE) - 1)) /
+                  (THREAD_SIZE * LOCAL_SIZE),
+              (COL_NUM + ((THREAD_SIZE * LOCAL_SIZE) - 1)) /
+                  (THREAD_SIZE * LOCAL_SIZE)),
+         dim3(THREAD_SIZE, THREAD_SIZE)>>>(dev_a, dev_b, dev_c, ROW_NUM,
+                                           COL_NUM, MID_NUM);
   cudaEventRecord(stop);
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&time_ms_kernel, start, stop);
@@ -157,7 +187,6 @@ int main() {
   cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, COL_NUM, ROW_NUM,
               MID_NUM, &alpha, dev_b, COL_NUM, dev_a, MID_NUM, &beta, dev_c,
               COL_NUM);
-
   cudaEventRecord(stop);
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&time_ms_cublas_kernel, start, stop);
@@ -168,7 +197,7 @@ int main() {
   float tflops =
       (2.0 * ROW_NUM * COL_NUM * MID_NUM) / (time_ms_kernel * 1e-3) / 1e12;
   if (compare_result(c, ground_truth) == 0) {
-    std::cout << "ok kernel time: " << time_ms_kernel << "ms, total time: "
+    std::cout << "ok\nkernel time: " << time_ms_kernel << "ms, total time: "
               << time_ms_memcpy_in + time_ms_kernel + time_ms_memcpy_out
               << "ms, tflops: " << tflops << std::endl;
     std::cout << "cublas kernel time: " << time_ms_cublas_kernel
