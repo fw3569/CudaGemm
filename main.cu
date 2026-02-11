@@ -11,45 +11,63 @@
 #define COL_NUM 1024
 #define MID_NUM 1024
 #define THREAD_SIZE 16
-#define LOCAL_SIZE 4
+#define LOCAL_SIZE 8
 #define VALUE_MAX 100.0f
 
-__global__ void gemm(float* a, float* b, float* c, int N, int M, int K) {
-  __shared__ alignas(
-      128) float sa[THREAD_SIZE * LOCAL_SIZE][THREAD_SIZE * LOCAL_SIZE];
-  __shared__ alignas(
-      128) float sb[THREAD_SIZE * LOCAL_SIZE][THREAD_SIZE * LOCAL_SIZE];
-  int base_row = blockIdx.x * THREAD_SIZE * LOCAL_SIZE;
-  int base_col = blockIdx.y * THREAD_SIZE * LOCAL_SIZE;
+__global__ void __launch_bounds__(THREAD_SIZE* THREAD_SIZE, 2)
+    gemm(float* a, float* b, float* c, int N, int M, int K) {
+  __shared__ alignas(128) float sa[THREAD_SIZE * LOCAL_SIZE][THREAD_SIZE];
+  __shared__ alignas(128) float sb[THREAD_SIZE][THREAD_SIZE * LOCAL_SIZE];
+  int base_row = blockIdx.y * THREAD_SIZE * LOCAL_SIZE;
+  int base_col = blockIdx.x * THREAD_SIZE * LOCAL_SIZE;
   float ans[LOCAL_SIZE][LOCAL_SIZE];
   memset(ans, 0, sizeof(ans));
-  for (int kh = 0; kh < K; kh += THREAD_SIZE * LOCAL_SIZE) {
-    for (int i = 0; i < LOCAL_SIZE * LOCAL_SIZE; ++i) {
+  for (int kh = 0; kh < K; kh += THREAD_SIZE) {
+    for (int i = 0; i < LOCAL_SIZE; i += 4) {
       int col = threadIdx.y * THREAD_SIZE + threadIdx.x +
                 i * THREAD_SIZE * THREAD_SIZE;
-      int row = col / (THREAD_SIZE * LOCAL_SIZE);
-      col %= THREAD_SIZE * LOCAL_SIZE;
+      int row = col / (THREAD_SIZE);
+      col %= THREAD_SIZE;
+      sa[row][col] = (base_row + row < N && kh + col < K) *
+                     (a[(base_row + row) * K + kh + col]);
+      row += THREAD_SIZE;
+      sa[row][col] = (base_row + row < N && kh + col < K) *
+                     (a[(base_row + row) * K + kh + col]);
+      row += THREAD_SIZE;
+      sa[row][col] = (base_row + row < N && kh + col < K) *
+                     (a[(base_row + row) * K + kh + col]);
+      row += THREAD_SIZE;
       sa[row][col] = (base_row + row < N && kh + col < K) *
                      (a[(base_row + row) * K + kh + col]);
     }
-    for (int i = 0; i < LOCAL_SIZE * LOCAL_SIZE; ++i) {
+    for (int i = 0; i < LOCAL_SIZE; i += 4) {
       int col = threadIdx.y * THREAD_SIZE + threadIdx.x +
                 i * THREAD_SIZE * THREAD_SIZE;
       int row = col / (THREAD_SIZE * LOCAL_SIZE);
       col %= THREAD_SIZE * LOCAL_SIZE;
       sb[row][col] = (kh + row < K && base_col + col < M) *
                      (b[(kh + row) * M + base_col + col]);
+      row += THREAD_SIZE / LOCAL_SIZE;
+      sb[row][col] = (kh + row < K && base_col + col < M) *
+                     (b[(kh + row) * M + base_col + col]);
+      row += THREAD_SIZE / LOCAL_SIZE;
+      sb[row][col] = (kh + row < K && base_col + col < M) *
+                     (b[(kh + row) * M + base_col + col]);
+      row += THREAD_SIZE / LOCAL_SIZE;
+      sb[row][col] = (kh + row < K && base_col + col < M) *
+                     (b[(kh + row) * M + base_col + col]);
     }
     __syncthreads();
 
-    for (int kl = 0; kl < THREAD_SIZE * LOCAL_SIZE; ++kl) {
-      float rega[LOCAL_SIZE];
-      float regb[LOCAL_SIZE];
+    float rega[LOCAL_SIZE] = {};
+    float regb[LOCAL_SIZE] = {};
+    for (int kl = 0; kl < THREAD_SIZE; ++kl) {
       for (int i = 0; i < LOCAL_SIZE; ++i) {
         rega[i] = sa[threadIdx.y + i * THREAD_SIZE][kl];
       }
-      for (int i = 0; i < LOCAL_SIZE; ++i) {
-        regb[i] = sb[kl][threadIdx.x + i * THREAD_SIZE];
+      for (int i = 0; i < LOCAL_SIZE; i += 4) {
+        *(float4*)(regb + i) =
+            *(float4*)(&sb[kl][threadIdx.x * 4 + THREAD_SIZE * i]);
       }
       for (int i = 0; i < LOCAL_SIZE; ++i) {
         for (int j = 0; j < LOCAL_SIZE; ++j) {
@@ -61,10 +79,22 @@ __global__ void gemm(float* a, float* b, float* c, int N, int M, int K) {
   }
   for (int i = 0;
        i < LOCAL_SIZE && base_row + threadIdx.y + i * THREAD_SIZE < N; ++i) {
-    for (int j = 0;
-         j < LOCAL_SIZE && base_col + threadIdx.x + j * THREAD_SIZE < M; ++j) {
-      c[(base_row + threadIdx.y + i * THREAD_SIZE) * M + base_col +
-        threadIdx.x + j * THREAD_SIZE] = ans[i][j];
+    if (M % 4 == 0) {
+      for (int j = 0; j < LOCAL_SIZE &&
+                      base_col + threadIdx.x * 4 + THREAD_SIZE * j + 3 < M;
+           j += 4) {
+        *(float4*)(&c[(base_row + threadIdx.y + i * THREAD_SIZE) * M +
+                      base_col + threadIdx.x * 4 + THREAD_SIZE * j]) =
+            *(float4*)(ans[i] + j);
+      }
+    } else {
+      for (int j = 0; j < LOCAL_SIZE; j += 4) {
+        for (int k = 0;
+             k < 4 && base_col + threadIdx.x + j * THREAD_SIZE + k < M; ++k) {
+          c[(base_row + threadIdx.y + i * THREAD_SIZE) * M + base_col +
+            threadIdx.x * 4 + j * THREAD_SIZE + k] = ans[i][j + k];
+        }
+      }
     }
   }
 }

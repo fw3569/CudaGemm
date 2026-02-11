@@ -5,6 +5,7 @@ set(CMAKE_CUDA_ARCHITECTURES 75)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_COMPILER_FORCED ON)
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
 project(Proj LANGUAGES CXX CUDA)
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT ProgramDatabase)
 add_executable(
@@ -13,9 +14,9 @@ add_executable(
 )
 find_package(CUDAToolkit REQUIRED)
 target_link_libraries(proj PRIVATE CUDA::cublas)
-target_compile_options(proj PRIVATE 
-    $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANGUAGE:CUDA>>:-Xcompiler /Zi>
+target_compile_options(proj PRIVATE
+$<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANGUAGE:CUDA>>:-Xcompiler /Zi>
 )
-target_link_options(proj PRIVATE 
+target_link_options(proj PRIVATE
     $<$<CONFIG:RelWithDebInfo>:-Xlinker /DEBUG>
 )
