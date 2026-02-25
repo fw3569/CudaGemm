@@ -14,8 +14,10 @@
 #define LOCAL_SIZE 8
 #define VALUE_MAX 100.0f
 
+// min 2 blocks per SM to hide latency while balancing register usage
 __global__ void __launch_bounds__(THREAD_SIZE* THREAD_SIZE, 2)
     gemm(float* a, float* b, float* c, int N, int M, int K) {
+  // align to cache line
   __shared__ alignas(128) float sa[THREAD_SIZE * LOCAL_SIZE][THREAD_SIZE];
   __shared__ alignas(128) float sb[THREAD_SIZE][THREAD_SIZE * LOCAL_SIZE];
   int base_row = blockIdx.y * THREAD_SIZE * LOCAL_SIZE;
@@ -23,10 +25,13 @@ __global__ void __launch_bounds__(THREAD_SIZE* THREAD_SIZE, 2)
   float ans[LOCAL_SIZE][LOCAL_SIZE];
   memset(ans, 0, sizeof(ans));
   for (int kh = 0; kh < K; kh += THREAD_SIZE) {
+    // copy to shared memory
     for (int i = 0; i < LOCAL_SIZE; i += 4) {
+      // linear indexing to enable coalesced access, and avoid bank conflict
       int col = threadIdx.y * THREAD_SIZE + threadIdx.x +
                 i * THREAD_SIZE * THREAD_SIZE;
       int row = col / (THREAD_SIZE);
+      // unroll to reuse row/col registers and maintain occupancy
       col %= THREAD_SIZE;
       sa[row][col] = (base_row + row < N && kh + col < K) *
                      (a[(base_row + row) * K + kh + col]);
@@ -41,9 +46,11 @@ __global__ void __launch_bounds__(THREAD_SIZE* THREAD_SIZE, 2)
                      (a[(base_row + row) * K + kh + col]);
     }
     for (int i = 0; i < LOCAL_SIZE; i += 4) {
+      // linear indexing to enable coalesced access, and avoid bank conflict
       int col = threadIdx.y * THREAD_SIZE + threadIdx.x +
                 i * THREAD_SIZE * THREAD_SIZE;
       int row = col / (THREAD_SIZE * LOCAL_SIZE);
+      // unroll to reuse row/col registers and maintain occupancy
       col %= THREAD_SIZE * LOCAL_SIZE;
       sb[row][col] = (kh + row < K && base_col + col < M) *
                      (b[(kh + row) * M + base_col + col]);
@@ -59,13 +66,16 @@ __global__ void __launch_bounds__(THREAD_SIZE* THREAD_SIZE, 2)
     }
     __syncthreads();
 
+    // calculate
     float rega[LOCAL_SIZE] = {};
     float regb[LOCAL_SIZE] = {};
+    // Outer-product based register blocking to maximize data reuse
     for (int kl = 0; kl < THREAD_SIZE; ++kl) {
       for (int i = 0; i < LOCAL_SIZE; ++i) {
         rega[i] = sa[threadIdx.y + i * THREAD_SIZE][kl];
       }
       for (int i = 0; i < LOCAL_SIZE; i += 4) {
+        // float4 to reduce io instructions, deal with mio stall
         *(float4*)(regb + i) =
             *(float4*)(&sb[kl][threadIdx.x * 4 + THREAD_SIZE * i]);
       }
@@ -83,11 +93,13 @@ __global__ void __launch_bounds__(THREAD_SIZE* THREAD_SIZE, 2)
       for (int j = 0; j < LOCAL_SIZE &&
                       base_col + threadIdx.x * 4 + THREAD_SIZE * j + 3 < M;
            j += 4) {
+        // float4 to reduce io instructions, deal with mio stall
         *(float4*)(&c[(base_row + threadIdx.y + i * THREAD_SIZE) * M +
                       base_col + threadIdx.x * 4 + THREAD_SIZE * j]) =
             *(float4*)(ans[i] + j);
       }
     } else {
+      // handling boundaries
       for (int j = 0; j < LOCAL_SIZE; j += 4) {
         for (int k = 0;
              k < 4 && base_col + threadIdx.x + j * THREAD_SIZE + k < M; ++k) {
@@ -224,8 +236,6 @@ int main() {
                         cudaMemcpyDeviceToHost));
 
   // cudaDeviceSynchronize();
-  float tflops =
-      (2.0 * ROW_NUM * COL_NUM * MID_NUM) / (time_ms_kernel * 1e-3) / 1e12;
   if (compare_result(c, ground_truth) == 0) {
     std::cout << "ok" << std::endl;
     for (int i = 0; i < 10; ++i) {
@@ -270,6 +280,8 @@ int main() {
       time_ms_cublas_kernel += time_ms;
     }
     time_ms_cublas_kernel /= 100;
+    float tflops =
+        (2.0 * ROW_NUM * COL_NUM * MID_NUM) / (time_ms_kernel * 1e-3) / 1e12;
     std::cout << "kernel time : " << time_ms_kernel << "ms, total time: "
               << time_ms_memcpy_in + time_ms_kernel + time_ms_memcpy_out
               << "ms, tflops: " << tflops << std::endl;
