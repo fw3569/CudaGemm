@@ -2,8 +2,9 @@
 一个CUDA GEMM算子
 
 #### 如何构建
-构建依赖`nvcc`和`msvc`和`Ninja`  
-请自行更改或在命令行指定`CMAKE_CUDA_HOST_COMPILER`，
+构建依赖`CMake`、`nvcc`、`MSVC`和`Ninja`  
+请自行更改或在命令行指定`CMAKE_CUDA_HOST_COMPILER`和`CMAKE_CXX_COMPILER`  
+在`x64 Native Tools Command Prompt for VS 2022`中运行
 ```
 cmake -G "Ninja Multi-Config" -S ./ -B build
 cmake --build ./build --config RelWithDebInfo
