@@ -17,10 +17,11 @@
 void gemm_cpu(float a[ROW_NUM][MID_NUM], float b[MID_NUM][COL_NUM], float* c) {
   for (int i = 0; i < ROW_NUM; ++i) {
     for (int j = 0; j < COL_NUM; ++j) {
-      c[i * COL_NUM + j] = 0;
+      double ans = 0;
       for (int k = 0; k < MID_NUM; ++k) {
-        c[i * COL_NUM + j] += a[i][k] * b[k][j];
+        ans += a[i][k] * b[k][j];
       }
+      c[i * COL_NUM + j] = ans;
     }
   }
 }
@@ -138,6 +139,7 @@ int main() {
                         cudaMemcpyDeviceToHost));
 
   // cudaDeviceSynchronize();
+  // gemm_cpu(a, b, ground_truth[0]);
   if (compare_result(c, ground_truth) == 0) {
     std::cout << "ok" << std::endl;
     for (int i = 0; i < 10; ++i) {

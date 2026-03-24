@@ -21,7 +21,7 @@ __global__ void __launch_bounds__(THREAD_SIZE* THREAD_SIZE, 2)
                 i * THREAD_SIZE * THREAD_SIZE;
       int row = col / (THREAD_SIZE);
       // unroll to reuse row/col registers and maintain occupancy
-      col %= THREAD_SIZE;
+      col &= THREAD_SIZE - 1;
       sa[row][col] = (base_row + row < N && kh + col < K) *
                      (a[(base_row + row) * K + kh + col]);
       row += THREAD_SIZE;
@@ -40,7 +40,7 @@ __global__ void __launch_bounds__(THREAD_SIZE* THREAD_SIZE, 2)
                 i * THREAD_SIZE * THREAD_SIZE;
       int row = col / (THREAD_SIZE * LOCAL_SIZE);
       // unroll to reuse row/col registers and maintain occupancy
-      col %= THREAD_SIZE * LOCAL_SIZE;
+      col &= THREAD_SIZE * LOCAL_SIZE - 1;
       sb[row][col] = (kh + row < K && base_col + col < M) *
                      (b[(kh + row) * M + base_col + col]);
       row += THREAD_SIZE / LOCAL_SIZE;
@@ -78,7 +78,7 @@ __global__ void __launch_bounds__(THREAD_SIZE* THREAD_SIZE, 2)
   }
   for (int i = 0;
        i < LOCAL_SIZE && base_row + threadIdx.y + i * THREAD_SIZE < N; ++i) {
-    if (M % 4 == 0) {
+    if ((M & 0x11) == 0) {
       for (int j = 0; j < LOCAL_SIZE &&
                       base_col + threadIdx.x * 4 + THREAD_SIZE * j + 3 < M;
            j += 4) {
@@ -91,7 +91,8 @@ __global__ void __launch_bounds__(THREAD_SIZE* THREAD_SIZE, 2)
       // handling boundaries
       for (int j = 0; j < LOCAL_SIZE; j += 4) {
         for (int k = 0;
-             k < 4 && base_col + threadIdx.x + j * THREAD_SIZE + k < M; ++k) {
+             k < 4 && base_col + threadIdx.x * 4 + j * THREAD_SIZE + k < M;
+             ++k) {
           c[(base_row + threadIdx.y + i * THREAD_SIZE) * M + base_col +
             threadIdx.x * 4 + j * THREAD_SIZE + k] = ans[i][j + k];
         }
@@ -102,7 +103,7 @@ __global__ void __launch_bounds__(THREAD_SIZE* THREAD_SIZE, 2)
 
 void gemm(float* a, float* b, float* c, int N, int M, int K) {
   gemm_kernel<<<
-      dim3((N + ((THREAD_SIZE * LOCAL_SIZE) - 1)) / (THREAD_SIZE * LOCAL_SIZE),
-           (M + ((THREAD_SIZE * LOCAL_SIZE) - 1)) / (THREAD_SIZE * LOCAL_SIZE)),
+      dim3((M + ((THREAD_SIZE * LOCAL_SIZE) - 1)) / (THREAD_SIZE * LOCAL_SIZE),
+           (N + ((THREAD_SIZE * LOCAL_SIZE) - 1)) / (THREAD_SIZE * LOCAL_SIZE)),
       dim3(THREAD_SIZE, THREAD_SIZE)>>>(a, b, c, N, M, K);
 }
