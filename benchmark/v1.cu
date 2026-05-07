@@ -52,6 +52,7 @@ extern "C" __declspec(dllexport) void run(float* d_A, float* d_B, float* d_C,
   for (int i = 0; i < warmup_runs; ++i) {
     gemm<<<blocks, threads>>>(d_A, d_B, d_C, n, m, k);
   }
+  cudaDeviceSynchronize();
 
   for (int i = 0; i < bench_runs; ++i) {
     cudaEventRecord(start);

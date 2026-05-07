@@ -9,9 +9,9 @@
 
 #include "gemm_kernel.cuh"
 
-#define ROW_NUM 1024
-#define COL_NUM 1024
-#define MID_NUM 1024
+#define ROW_NUM 2048
+#define COL_NUM 2048
+#define MID_NUM 2048
 #define VALUE_MAX 100.0f
 
 void gemm_cpu(float a[ROW_NUM][MID_NUM], float b[MID_NUM][COL_NUM], float* c) {

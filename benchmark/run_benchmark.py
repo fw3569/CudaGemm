@@ -48,7 +48,7 @@ KERNELS = [
         "color":  "#3b82f6",
     },
     {
-        "label": "v3\n(float4, register limit)",
+        "label": "v3\n(float4, register limit, swizzle)",
         "short":  "v3",
         "src":    "v3.cu",
         "fn":     "run",
@@ -70,7 +70,7 @@ def compile_kernel(src_name: str, out_so: str) -> bool:
     """Compile a .cu file to a shared library. Returns True on success."""
     src = os.path.join(SCRIPT_DIR, src_name)
     cmd = [
-        "nvcc", "-ccbin", "D:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe", "-O3", "--shared", "-lcublas", "-Xcompiler", "/LD,/O2", src, "-o", out_so
+        "nvcc", "-arch=sm_75", "-ccbin", "D:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe", "-O3", "--shared", "-lcublas", "-Xcompiler", "/LD,/O2", src, "-o", out_so
     ]
     print(f"  Compiling {src_name} …", end=" ", flush=True)
     result = subprocess.run(cmd, capture_output=True, text=True)

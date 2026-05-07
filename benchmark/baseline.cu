@@ -15,6 +15,7 @@ extern "C" __declspec(dllexport) void run(float* d_A, float* d_B, float* d_C,
   cudaEventCreate(&stop);
   cublasHandle_t cublas_handle;
   cublasCreate(&cublas_handle);
+  cublasSetMathMode(cublas_handle, CUBLAS_PEDANTIC_MATH);
   float alpha = 1.0f;
   float beta = 0.0f;
   std::vector<float> ms(bench_runs, 0.0f);
@@ -22,6 +23,7 @@ extern "C" __declspec(dllexport) void run(float* d_A, float* d_B, float* d_C,
     cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, d_B,
                 m, d_A, k, &beta, d_C, m);
   }
+  cudaDeviceSynchronize();
 
   for (int i = 0; i < bench_runs; ++i) {
     cudaEventRecord(start);
