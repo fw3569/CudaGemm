@@ -1,16 +1,18 @@
 #include "gemm_kernel.cuh"
 
+// stride k
+#define STRIDE_K 16
 // threads of block
 #define TOBM 16
 #define TOBN 16
 // elements of thread
 #define EOTM 8
 #define EOTN 8
+// thread of warp
+#define TOWM (32 / TOBN)
 // elements of block
 #define EOBM (TOBM * EOTM)
 #define EOBN (TOBN * EOTN)
-// stride k
-#define STRIDE_K 16
 
 #ifndef USE_DOUBLE_BUFFER
 #define USE_DOUBLE_BUFFER false
@@ -39,8 +41,9 @@ __global__ void __launch_bounds__(TOBM* TOBN, 2)
        i * TOBN < STRIDE_K * EOTM; ++i, o += TOBN * TOBM) {
     int row = o / STRIDE_K;
     int col = o & (STRIDE_K - 1);
-    __pipeline_memcpy_async(&sa[cache_id][col][row ^ (col >> 2)],
-                            &a[min((block_row + row) * K + col, M * K - 1)], 4);
+    __pipeline_memcpy_async(&sa[cache_id][col][row ^ (col / (STRIDE_K >> 2))],
+                            &a[min((block_row + row) * K + col, M * K - 1)], 4,
+                            4 * !((block_row + row < M) & (col < K)));
   }
 #pragma unroll
   for (int i = 0, o = threadIdx.y * TOBN + threadIdx.x;
@@ -48,72 +51,51 @@ __global__ void __launch_bounds__(TOBM* TOBN, 2)
     int row = o / EOBN;
     int col = o & (EOBN - 1);
     __pipeline_memcpy_async(&sb[cache_id][row][col],
-                            &b[min((row)*N + block_col + col, K * N - 1)], 4);
+                            &b[min((row)*N + block_col + col, K * N - 1)], 4,
+                            4 * !((row < K) & (block_col + col < N)));
   }
   __pipeline_commit();
   cache_id ^= 1;
+#else
+#pragma unroll
+  for (int i = 0, o = threadIdx.y * TOBN + threadIdx.x;
+       i * TOBN < STRIDE_K * EOTM; ++i, o += TOBN * TOBM) {
+    // linear indexing to enable coalesced access
+    int row = o / STRIDE_K;
+    int col = o & (STRIDE_K - 1);
+    // transpose to support float4 load latter
+    // multiple instead of if statement, friendly to instruction reordering
+    // swizzle 0-3, shift 4 bank each row
+    sa[col][row ^ (col / (STRIDE_K >> 2))] =
+        ((block_row + row < M) & (col < K)) *
+        a[min((block_row + row) * K + col, M * K - 1)];
+  }
 #endif
   for (int kh = 0; kh < K; kh += STRIDE_K) {
     // copy to shared memory
 #if USE_DOUBLE_BUFFER
-    if (kh + STRIDE_K < K) {
 #endif
-#pragma unroll
-      for (int i = 0, o = threadIdx.y * TOBN + threadIdx.x;
-           i * TOBN < STRIDE_K * EOTM; ++i, o += TOBN * TOBM) {
-        // linear indexing to enable coalesced access
-        int row = o / STRIDE_K;
-        int col = o & (STRIDE_K - 1);
-        // transpose to support float4 load latter
-        // multiple instead of if statement, friendly to instruction reordering
-        // swizzle 0-3, shift 4 bank each row
-#if USE_DOUBLE_BUFFER
-        __pipeline_memcpy_async(
-            &sa[cache_id][col][row ^ (col >> 2)],
-            &a[min((block_row + row) * K + kh + STRIDE_K + col, M * K - 1)], 4);
-#else
-      sa[col][row ^ (col >> 2)] =
-          (block_row + row < M && kh + col < K) *
-          a[min((block_row + row) * K + kh + col, M * K - 1)];
-#endif
-      }
-#pragma unroll
-      for (int i = 0, o = threadIdx.y * TOBN + threadIdx.x;
-           i * TOBM < STRIDE_K * EOTN; ++i, o += TOBN * TOBM) {
-        // linear indexing to enable coalesced access
-        int row = o / EOBN;
-        int col = o & (EOBN - 1);
-        // multiple instead of if statement, friendly to instruction reordering
-#if USE_DOUBLE_BUFFER
-        __pipeline_memcpy_async(
-            &sb[cache_id][row][col],
-            &b[min((kh + STRIDE_K + row) * N + block_col + col, K * N - 1)], 4);
-#else
-      sb[row][col] = (kh + row < K && block_col + col < N) *
-                     b[min((kh + row) * N + block_col + col, K * N - 1)];
-#endif
-      }
-#if USE_DOUBLE_BUFFER
-    }
-    __pipeline_commit();
-    __pipeline_wait_prior(1);
-    cache_id ^= 1;
-    __syncthreads();
-#pragma unroll
-    for (int i = 0, o = threadIdx.y * TOBN + threadIdx.x;
-         i * TOBN < STRIDE_K * EOTM; ++i, o += TOBN * TOBM) {
-      int row = o / STRIDE_K;
-      int col = o & (STRIDE_K - 1);
-      sa[cache_id][col][row ^ (col >> 2)] *=
-          (block_row + row < M && kh + col < K);
-    }
 #pragma unroll
     for (int i = 0, o = threadIdx.y * TOBN + threadIdx.x;
          i * TOBM < STRIDE_K * EOTN; ++i, o += TOBN * TOBM) {
+      // linear indexing to enable coalesced access
       int row = o / EOBN;
       int col = o & (EOBN - 1);
-      sb[cache_id][row][col] *= (kh + row < K && block_col + col < N);
+      // multiple instead of if statement, friendly to instruction reordering
+#if USE_DOUBLE_BUFFER
+      __pipeline_memcpy_async(
+          &sb[cache_id][row][col],
+          &b[min((kh + STRIDE_K + row) * N + block_col + col, K * N - 1)], 4,
+          4 * !((kh + STRIDE_K + row < K) & (block_col + col < N)));
+#else
+      sb[row][col] = ((kh + row < K) & (block_col + col < N)) *
+                     b[min((kh + row) * N + block_col + col, K * N - 1)];
+#endif
     }
+#if USE_DOUBLE_BUFFER
+    __pipeline_commit();
+    __pipeline_wait_prior(1);
+    cache_id ^= 1;
 #endif
     __syncthreads();
 
@@ -122,7 +104,8 @@ __global__ void __launch_bounds__(TOBM* TOBN, 2)
     for (int kl = 0; kl < STRIDE_K; ++kl) {
       float rega[EOTM], regb[EOTN];
 #pragma unroll
-      for (int i = 0, p = (threadIdx.y << 2); i < EOTM; i += 4, p += 4 * TOBM) {
+      for (int i = 0, p = (threadIdx.y << 2) * (EOTM >> 2); i < EOTM;
+           i += 4, p += 4) {
         // float4 to reduce io instructions, deal with mio throttle
 #if USE_DOUBLE_BUFFER
         *(float4*)(&rega[i]) = *(float4*)(&sa[cache_id][kl][p]);
@@ -144,26 +127,53 @@ __global__ void __launch_bounds__(TOBM* TOBN, 2)
 #pragma unroll
         for (int j = 0; j < EOTN; ++j) {
           // swizzle 0-3, shift 4 bank each row
-          accum[i][j] += rega[i ^ (kl >> 2)] * regb[j];
+          accum[i][j] += rega[i ^ (kl / (STRIDE_K >> 2))] * regb[j];
         }
       }
     }
+#if !USE_DOUBLE_BUFFER
+#pragma unroll
+    for (int i = 0, o = ((threadIdx.y & (~(TOWM - 1))) * STRIDE_K * EOTM) +
+                        (threadIdx.y & (TOWM - 1)) * TOBN + threadIdx.x;
+         i * TOBN < STRIDE_K * EOTM; ++i, o += 32) {
+      int row = o / STRIDE_K;
+      int col = o & (STRIDE_K - 1);
+      // be reordered to interleaved execution, perfetch data used by this warp
+      sa[col][row ^ (col / (STRIDE_K >> 2))] =
+          ((block_row + row < M) & (kh + STRIDE_K + col < K)) *
+          a[min((block_row + row) * K + kh + STRIDE_K + col, M * K - 1)];
+    }
+#else
+#pragma unroll
+    for (int i = 0, o = ((threadIdx.y & (~(TOWM - 1))) * STRIDE_K * EOTM) +
+                        (threadIdx.y & (TOWM - 1)) * TOBN + threadIdx.x;
+         i * TOBN < STRIDE_K * EOTM; ++i, o += 32) {
+      int row = o / STRIDE_K;
+      int col = o & (STRIDE_K - 1);
+      // be reordered to interleaved execution, perfetch data used by this warp
+      __pipeline_memcpy_async(
+          &sa[cache_id ^ 1][col][row ^ (col / (STRIDE_K >> 2))],
+          &a[min((block_row + row) * K + kh + STRIDE_K + col, M * K - 1)], 4,
+          4 * !((block_row + row < M) & (kh + STRIDE_K + col < K)));
+    }
+#endif
     __syncthreads();
   }
-  if ((N & 3) == 0 && ((uintptr_t)c & 3) == 0) [[likely]] {
+  if (((N & 3) == 0) & (((uintptr_t)c & 3) == 0)) [[likely]] {
 #pragma unroll
-    for (int i = 0;
-         i < EOTM &&
-         block_row + (threadIdx.y << 2) + (i & ~3) * TOBM + (i & 3) < M;
-         ++i) {
+    for (int i = 0; i < EOTM; ++i) {
+      if (block_row + (threadIdx.y << 2) * (EOTM >> 2) + (i & (EOTM - 1)) >=
+          M) {
+        break;
+      }
 #pragma unroll
-      for (int j = 0;
-           j < EOTN &&
-           block_col + (threadIdx.x << 2) + (j & ~3) * TOBN + (j & 3) < N;
-           j += 4) {
+      for (int j = 0; j < EOTN; j += 4) {
+        if (block_col + (threadIdx.x << 2) + j * TOBN >= N) {
+          break;
+        }
         // float4 to reduce instructions and address calculate
-        *(float4*)(&c[(block_row + (threadIdx.y << 2) + (i & ~3) * TOBM +
-                       (i & 3)) *
+        *(float4*)(&c[(block_row + (threadIdx.y << 2) * (EOTM >> 2) +
+                       (i & (EOTM - 1))) *
                           N +
                       block_col + (threadIdx.x << 2) + j * TOBN]) =
             *(float4*)(&accum[i][j]);
@@ -171,16 +181,17 @@ __global__ void __launch_bounds__(TOBM* TOBN, 2)
     }
   } else {
 #pragma unroll
-    for (int i = 0;
-         i < EOTM &&
-         block_row + (threadIdx.y << 2) + (i & ~3) * TOBM + (i & 3) < M;
-         ++i) {
+    for (int i = 0; i < EOTM; ++i) {
+      if ((threadIdx.y << 2) * (EOTM >> 2) + (i & (EOTM - 1)) >= M) {
+        break;
+      }
 #pragma unroll
-      for (int j = 0;
-           j < EOTN &&
-           block_col + (threadIdx.x << 2) + (j & ~3) * TOBN + (j & 3) < N;
-           ++j) {
-        c[(block_row + (threadIdx.y << 2) + (i & ~3) * TOBM + (i & 3)) * N +
+      for (int j = 0; j < EOTN; ++j) {
+        if (block_col + (threadIdx.x << 2) + (j & ~3) * TOBN + (j & 3) >= N) {
+          break;
+        }
+        c[(block_row + (threadIdx.y << 2) * (EOTM >> 2) + (i & (EOTM - 1))) *
+              N +
           block_col + (threadIdx.x << 2) + (j & ~3) * TOBN + (j & 3)] =
             accum[i][j];
       }

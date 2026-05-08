@@ -1,30 +1,13 @@
-"""
-cuda_benchmark.py
------------------
-Compiles multiple .cu files, runs their kernels via ctypes, and
-plots a performance comparison chart.
-
-Requirements:
-  - NVIDIA GPU + CUDA toolkit (nvcc)
-  - Python packages: numpy, matplotlib, ctypes (stdlib)
-
-  Install extras if missing:
-    pip install numpy matplotlib
-"""
-
 import ctypes
 import subprocess
 import os
 import sys
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")          # headless backend – works without a display
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-# ─────────────────────────────────────────────
-# 1. Kernel registry
-# ─────────────────────────────────────────────
 KERNELS = [
     {
         "label": "baseline\n(cublas)",
@@ -56,18 +39,14 @@ KERNELS = [
     },
 ]
 
-# Array sizes to benchmark (must be divisible by 4 for vec4 kernel)
-SIZES = [1 << k for k in range(0, 13)]
+SIZES       = [1 << k for k in range(0, 13)]
 WARMUP_RUNS = 20
 BENCH_RUNS  = 100
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-
-# ─────────────────────────────────────────────
-# 2. Compilation helpers
-# ─────────────────────────────────────────────
+VERIFY_N    = 1024
+VERIFY_TOL  = 1e-3
 
 def compile_kernel(src_name: str, out_so: str) -> bool:
-    """Compile a .cu file to a shared library. Returns True on success."""
     src = os.path.join(SCRIPT_DIR, src_name)
     cmd = [
         "nvcc", "-arch=sm_75", "-ccbin", "D:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe", "-O3", "--shared", "-lcublas", "-Xcompiler", "/LD,/O2", src, "-o", out_so
@@ -86,27 +65,22 @@ def load_library(so_path: str):
     lib = ctypes.CDLL(so_path)
     return lib
 
-
 def setup_kernel(lib, fn_name: str):
-    """Set ctypes argument / return types for the kernel wrapper function."""
     fn = getattr(lib, fn_name)
     fn.restype  = None
     fn.argtypes = [
-        ctypes.c_void_p,   # d_A
-        ctypes.c_void_p,   # d_B
-        ctypes.c_void_p,   # d_C
-        ctypes.c_int,      # n
-        ctypes.c_int,      # m
-        ctypes.c_int,      # k
-        ctypes.POINTER(ctypes.c_float),  # ms_out
-        ctypes.c_int,      # warmup_runs
-        ctypes.c_int,      # bench_runs
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_int,
     ]
     return fn
 
-# ─────────────────────────────────────────────
-# 3. CUDA memory helpers via libcuda / libcudart
-# ─────────────────────────────────────────────
 cuda_bin_path = r"D:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4\\bin"
 os.add_dll_directory(cuda_bin_path)
 try:
@@ -131,23 +105,51 @@ def cuda_free(ptr):
     cudart.cudaFree(ptr)
 
 def cuda_memcpy_h2d(dst, src_np: np.ndarray):
-    cudart.cudaMemcpy(dst, src_np.ctypes.data, src_np.nbytes, ctypes.c_int(1))  # H2D=1
+    cudart.cudaMemcpy(dst, src_np.ctypes.data, src_np.nbytes, ctypes.c_int(1))
+
+def cuda_memcpy_d2h(dst_np: np.ndarray, src):
+    cudart.cudaMemcpy(dst_np.ctypes.data, src, dst_np.nbytes, ctypes.c_int(0))
 
 def cuda_memset(ptr, val: int, nbytes: int):
     cudart.cudaMemset(ptr, val, nbytes)
 
-# ─────────────────────────────────────────────
-# 4. Benchmark a single kernel at one size
-# ─────────────────────────────────────────────
+def verify_kernel(fn, label: str, rng: np.random.Generator) -> bool:
+    n      = VERIFY_N
+    nbytes = n * n * 4
+    h_A = rng.random(n * n, dtype=np.float32)
+    h_B = rng.random(n * n, dtype=np.float32)
+    d_A = cuda_malloc(nbytes)
+    d_B = cuda_malloc(nbytes)
+    d_C = cuda_malloc(nbytes)
+
+    cuda_memcpy_h2d(d_A, h_A)
+    cuda_memcpy_h2d(d_B, h_B)
+    cuda_memset(d_C, 0, nbytes)
+
+    ms_val = ctypes.c_float(0.0)
+    fn(d_A, d_B, d_C, n, n, n, ctypes.byref(ms_val), 0, 1)
+    h_C = np.zeros(n * n, dtype=np.float16)
+    cuda_memcpy_d2h(h_C, d_C)
+
+    cuda_free(d_A)
+    cuda_free(d_B)
+    cuda_free(d_C)
+    A     = h_A.reshape(n, n)
+    B     = h_B.reshape(n, n)
+    C_ref = A @ B
+    C_got = h_C.reshape(n, n)
+    max_err = np.max(np.abs(C_got - C_ref))
+    rel_err = max_err / (np.max(np.abs(C_ref)) + 1e-9)
+    passed  = rel_err < VERIFY_TOL
+
+    status = "PASS" if passed else "FAIL"
+    print(f"    [{status}] {label:30s}  max_abs_err={max_err:.4e}  rel_err={rel_err:.4e}")
+    return passed
 
 def benchmark(fn, d_A, d_B, d_C, n: int, m: int, k: int) -> float:
     ms_val = ctypes.c_float(0.0)
     fn(d_A, d_B, d_C, n, m, k, ctypes.byref(ms_val), WARMUP_RUNS, BENCH_RUNS)
     return ms_val.value
-
-# ─────────────────────────────────────────────
-# 5. Main: compile → run → collect results
-# ─────────────────────────────────────────────
 
 def main():
     print("=" * 60)
@@ -158,8 +160,7 @@ def main():
     if not os.path.exists(SCRIPT_DIR+"\\dll"):
         os.makedirs(SCRIPT_DIR+"\\dll")
 
-    # Compile all kernels
-    print("\n[1/3] Compiling kernels …")
+    print("\n[1/4] Compiling kernels …")
     for k in KERNELS:
         out = os.path.join(SCRIPT_DIR+"\\dll", f"{k['short']}.dll")
         if not compile_kernel(k["src"], out):
@@ -170,22 +171,35 @@ def main():
         fn  = setup_kernel(lib, k["fn"])
         loaded.append(fn)
 
-    # Allocate maximum-size GPU buffers once
-    print("\n[2/3] Allocating GPU memory …")
+    print("\n[2/4] Verifying correctness (n={}) …".format(VERIFY_N))
+    verify_rng = np.random.default_rng(0)
+    verify_passed = []
+    for k, fn in zip(KERNELS, loaded):
+        if fn is None:
+            print(f"    [SKIP] {k['label'].replace(chr(10), ' ')}")
+            verify_passed.append(False)
+            continue
+        ok = verify_kernel(fn, k["label"].replace("\n", " "), verify_rng)
+        verify_passed.append(ok)
+
+    failed = [k["label"].replace("\n", " ") for k, ok in zip(KERNELS, verify_passed) if not ok and loaded[KERNELS.index(k)] is not None]
+    if failed:
+        print(f"\n  WARNING: correctness check FAILED for: {', '.join(failed)}")
+        print("  These kernels will still be benchmarked but results may be meaningless.\n")
+
+    print("\n[3/4] Allocating GPU memory …")
     n_max   = max(SIZES)
-    nbytes  = n_max * n_max * 4   # float32
+    nbytes  = n_max * n_max * 4
     rng = np.random.default_rng(42)
     h_A = rng.random(n_max * n_max, dtype=np.float32)
     h_B = rng.random(n_max * n_max, dtype=np.float32)
-
     d_A = cuda_malloc(nbytes)
     d_B = cuda_malloc(nbytes)
     d_C = cuda_malloc(nbytes)
     cuda_memcpy_h2d(d_A, h_A)
     cuda_memcpy_h2d(d_B, h_B)
 
-    # Benchmark
-    print("\n[3/3] Running benchmarks …\n")
+    print("\n[4/4] Running benchmarks …\n")
     results = {k["short"]: [] for k in KERNELS}
 
     for n in SIZES:
@@ -208,10 +222,6 @@ def main():
 
     plot_results(results)
 
-# ─────────────────────────────────────────────
-# 6. Plotting
-# ─────────────────────────────────────────────
-
 def plot_results(results: dict):
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     fig.patch.set_facecolor("#0f172a")
@@ -228,7 +238,6 @@ def plot_results(results: dict):
                  for n in SIZES]
     x = np.arange(len(SIZES))
 
-    # ── Left: Latency ──────────────────────────────────────────────
     ax = axes[0]
     for k in KERNELS:
         y = np.array(results[k["short"]], dtype=float)
@@ -257,7 +266,6 @@ def plot_results(results: dict):
     ax.legend(framealpha=0.15, labelcolor="#f1f5f9", fontsize=8.5,
               loc="upper left", facecolor="#1e293b", edgecolor="#475569")
 
-    # ── Right: Performance (TFLOPS) ────────────────────────────────
     ax = axes[1]
     for k in KERNELS:
         y_ms = np.array(results[k["short"]], dtype=float)
@@ -294,7 +302,6 @@ def plot_results(results: dict):
     plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close()
     print(f"\nChart saved → {out}")
-
 
 if __name__ == "__main__":
     main()
