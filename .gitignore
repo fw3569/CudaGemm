@@ -2,3 +2,4 @@
 build
 .cache
 benchmark/dll
+benchmark_linux/dll
